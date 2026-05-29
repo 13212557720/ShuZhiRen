@@ -10,3 +10,4 @@ downloads/
 *.avi
 env
 highlight_clipper/env
+qwen.py
