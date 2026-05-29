@@ -1,0 +1,12 @@
+__pycache__/
+*.pyc
+output/*
+!output/.gitkeep
+highlights/
+downloads/
+*.mp4
+*.webm
+*.mkv
+*.avi
+env
+highlight_clipper/env
