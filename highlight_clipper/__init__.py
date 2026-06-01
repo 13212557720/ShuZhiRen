@@ -1,0 +1,2 @@
+"""Highlight clipping package."""
+

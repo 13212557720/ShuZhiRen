@@ -16,11 +16,12 @@ YouTube / 多平台视频下载工具
     from yt_downloader import download_video, get_video_info
 """
 
+from __future__ import annotations
+
 import argparse
 import os
 import sys
 import time
-from pathlib import Path
 from typing import Any
 
 try:
@@ -131,8 +132,6 @@ def _progress_hook(d: dict[str, Any]) -> None:
         pct = d.get("_percent_str", "  ?%").strip()
         speed = d.get("_speed_str", "?")
         eta = d.get("_eta_str", "?")
-        filename = d.get("filename", "")
-        name = os.path.basename(filename) if filename else "..."
 
         msg = f"  下载中 {pct}  速度 {speed}  剩余 {eta}"
         if len(msg) > 100:

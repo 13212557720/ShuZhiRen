@@ -193,37 +193,75 @@ def analyze_video(video_input, api_key, base_url, model, log_callback=None):
     if log_callback:
         log_callback("Gemini 分析视频中...")
 
-    url = f"{base_url.rstrip('/')}/v1beta/models/{model}:generateContent"
+    base_url = base_url.rstrip("/")
+    if "generativelanguage.googleapis.com" in base_url:
+        raw_text = _call_gemini_api(video_input, api_key, base_url, model, log_callback)
+    else:
+        raw_text = _call_openai_compatible_api(video_input, api_key, base_url, model, log_callback)
+
+    if log_callback:
+        log_callback(f"Gemini 返回:\n{raw_text[:300]}...")
+
+    return _parse_highlights(raw_text)
+
+
+def _call_gemini_api(video_input, api_key, base_url, model, log_callback):
+    url = f"{base_url}/v1beta/models/{model}:generateContent"
     headers = {
         "Content-Type": "application/json",
         "x-goog-api-key": api_key,
     }
 
-    if isinstance(video_input, Path) or ("/" not in str(video_input) and "\\" not in str(video_input)):
-        pass
-
     if _is_url(str(video_input)):
         payload = _build_url_payload(video_input, HIGHLIGHT_PROMPT)
         if log_callback:
-            log_callback(f"使用 URL 模式: {video_input}")
+            log_callback(f"使用 URL 模式 (Gemini): {video_input}")
     else:
         video_path = Path(video_input)
         payload = _build_file_payload(video_path, HIGHLIGHT_PROMPT)
         size_mb = video_path.stat().st_size / 1024 / 1024
         if log_callback:
-            log_callback(f"使用文件模式: {video_path.name} ({size_mb:.1f}MB)")
+            log_callback(f"使用文件模式 (Gemini): {video_path.name} ({size_mb:.1f}MB)")
 
     resp = requests.post(url, headers=headers, json=payload, timeout=180)
     if resp.status_code != 200:
         raise RuntimeError(f"Gemini API 错误 ({resp.status_code}): {resp.text[:500]}")
 
     data = resp.json()
-    raw_text = data["candidates"][0]["content"]["parts"][0]["text"]
+    return data["candidates"][0]["content"]["parts"][0]["text"]
 
-    if log_callback:
-        log_callback(f"Gemini 返回:\n{raw_text[:300]}...")
 
-    return _parse_highlights(raw_text)
+def _call_openai_compatible_api(video_input, api_key, base_url, model, log_callback):
+    url = f"{base_url}/v1/chat/completions"
+    headers = {
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {api_key}",
+    }
+
+    if _is_url(str(video_input)):
+        prompt_text = f"{HIGHLIGHT_PROMPT}\n\n视频链接: {video_input}"
+        if log_callback:
+            log_callback(f"使用 URL 模式 (OpenAI兼容): {video_input}")
+    else:
+        video_path = Path(video_input)
+        prompt_text = HIGHLIGHT_PROMPT
+        size_mb = video_path.stat().st_size / 1024 / 1024
+        if log_callback:
+            log_callback(f"使用文件模式 (OpenAI兼容): {video_path.name} ({size_mb:.1f}MB)")
+
+    payload = {
+        "model": model,
+        "messages": [{"role": "user", "content": prompt_text}],
+        "max_tokens": 8000,
+        "temperature": 0.2,
+    }
+
+    resp = requests.post(url, headers=headers, json=payload, timeout=180)
+    if resp.status_code != 200:
+        raise RuntimeError(f"Gemini API 错误 ({resp.status_code}): {resp.text[:500]}")
+
+    data = resp.json()
+    return data["choices"][0]["message"]["content"]
 
 
 def _is_url(s):

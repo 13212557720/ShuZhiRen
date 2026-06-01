@@ -1,0 +1,36 @@
+[project]
+name = "auto-highlight-clipper"
+version = "0.1.0"
+description = "YouTube video downloader and Gemini-powered highlight clipping tool."
+readme = "README.md"
+requires-python = ">=3.14.5"
+dependencies = [
+    "flask>=3.0.0",
+    "requests>=2.32.0",
+    "yt-dlp[curl-cffi,default]",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0.0",
+]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+markers = [
+    "integration: tests that require external services or network access",
+]
+
+[tool.hatch.metadata]
+allow-direct-references = true
+
+[tool.hatch.build.targets.wheel]
+packages = ["."]
+artifacts = ["*.py", "*.html", "*.txt", "*.md", "*.json", "*.command"]
+
+[tool.uv.sources]
+yt-dlp = { git = "https://github.com/yt-dlp/yt-dlp.git", rev = "master" }
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"

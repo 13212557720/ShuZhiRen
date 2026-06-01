@@ -1,5 +1,9 @@
 __pycache__/
 *.pyc
+.DS_Store
+.venv/
+venv/
+.runtime/
 output/*
 !output/.gitkeep
 highlights/
@@ -10,4 +14,6 @@ downloads/
 *.avi
 env
 highlight_clipper/env
+youtube_cookies.txt
+cookie copy.md
 qwen.py
