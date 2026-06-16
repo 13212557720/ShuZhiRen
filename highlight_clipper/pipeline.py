@@ -7,7 +7,7 @@ from pathlib import Path
 import yt_dlp
 
 from .video_utils import clip_video, get_video_info
-from .gemini_analyzer import analyze_video
+from .gemini_analyzer import analyze_video_with_fallbacks
 
 
 QUALITY_HEIGHTS = {
@@ -36,6 +36,7 @@ class Pipeline:
         js_runtime_path=None,
         player_client=None,
         sleep_interval=0,
+        analysis_candidates=None,
         log_callback=None,
         stop_check=None,
     ):
@@ -50,6 +51,9 @@ class Pipeline:
         self.js_runtime_path = js_runtime_path
         self.player_client = player_client
         self.sleep_interval = sleep_interval
+        self.analysis_candidates = analysis_candidates or [
+            {"provider": "PRIMARY", "api_key": api_key, "base_url": base_url, "model": model}
+        ]
         self.output_dir.mkdir(parents=True, exist_ok=True)
         self.log = log_callback or (lambda msg: print(msg))
         self.stop_check = stop_check or (lambda: False)
@@ -72,7 +76,7 @@ class Pipeline:
 
     def _process_one(self, url):
         self.log("步骤1/3: Gemini 分析视频 (直连YouTube)...")
-        highlights = analyze_video(url, self.api_key, self.base_url, self.model, log_callback=self.log)
+        highlights = analyze_video_with_fallbacks(url, self.analysis_candidates, log_callback=self.log)
 
         if highlights:
             self.log(f"发现 {len(highlights)} 个高光片段，开始下载视频...")
@@ -97,7 +101,7 @@ class Pipeline:
             clips = self._clip(video_path, title, highlights, video_duration, video_dir)
         else:
             self.log("步骤3/3: 无高光片段，跳过剪辑")
-        self._write_manifest(video_dir, url, title, video_path, highlights, clips)
+        _write_manifest(video_dir, url, title, video_path, highlights, clips)
 
         return {
             "url": url,
@@ -113,7 +117,7 @@ class Pipeline:
         clips_dir = video_dir / "highlights"
         clips_dir.mkdir(parents=True, exist_ok=True)
 
-        highlights.sort(key=lambda x: x.get("score", 0), reverse=True)
+        highlights.sort(key=lambda x: x.get("start", 0))
 
         clips = []
         for j, h in enumerate(highlights):
@@ -129,6 +133,10 @@ class Pipeline:
                 end = video_duration
 
             duration = int(end - start)
+            if duration <= 0:
+                self.log(f"  跳过 [{start:.0f}s - {end:.0f}s] {h['desc']} (片段时长无效)")
+                continue
+
             score = h.get("score", 0)
             desc = h.get("desc", "高光")
             safe_desc = _safe_filename(desc)[:20]

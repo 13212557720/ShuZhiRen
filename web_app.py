@@ -5,18 +5,22 @@ from __future__ import annotations
 
 import json
 import os
+import ipaddress
 import queue
 import re
 import shutil
+import socket
+import subprocess
 import threading
 import time
 import uuid
 import webbrowser
+import zipfile
 from pathlib import Path
 
 import yt_dlp
 from yt_dlp.version import __version__ as YT_DLP_VERSION
-from flask import Flask, jsonify, request
+from flask import Flask, jsonify, request, send_file
 
 from highlight_clipper.pipeline import Pipeline
 
@@ -29,6 +33,7 @@ RUNTIME_DIR = APP_DIR / ".runtime"
 DEFAULT_COOKIES_FILE = APP_DIR / "youtube_cookies.txt"
 CODEX_NODE_PATH = Path("/Applications/Codex.app/Contents/Resources/node")
 JOBS: dict[str, "Job"] = {}
+ARTIFACTS: dict[str, Path] = {}
 QUALITY_HEIGHTS = {
     "4k": 2160,
     "2k": 1440,
@@ -39,6 +44,9 @@ QUALITY_HEIGHTS = {
     "240p": 240,
 }
 AUTO_QUALITY_ORDER = ("720p", "1080p", "480p", "360p", "240p")
+SERVER_PORT = 7860
+DEFAULT_GRS_MODEL_ORDER = ("gemini-3.1-pro", "gemini-3.5-flash", "gemini-2.5-pro", "gemini-2.5-flash")
+DEFAULT_ZHENZHEN_MODEL_ORDER = ("gemini-2.5-pro", "gemini-2.5-flash")
 
 
 def load_env(path: Path) -> dict[str, str]:
@@ -100,10 +108,155 @@ def default_cookies_file(env: dict[str, str]) -> str:
     return str(DEFAULT_COOKIES_FILE) if DEFAULT_COOKIES_FILE.exists() else ""
 
 
+def comma_values(value: str | None) -> list[str]:
+    if not value:
+        return []
+    return [item.strip() for item in value.split(",") if item.strip()]
+
+
+def unique_values(values) -> list[str]:
+    result = []
+    seen = set()
+    for value in values:
+        value = (value or "").strip()
+        if value and value not in seen:
+            seen.add(value)
+            result.append(value)
+    return result
+
+
+def build_analysis_candidates(env: dict[str, str], primary: dict) -> list[dict[str, str]]:
+    primary_api_key = (primary.get("apiKey") or "").strip()
+    primary_base_url = (primary.get("apiBase") or "").strip()
+    primary_model = (primary.get("model") or "").strip()
+
+    candidates: list[dict[str, str]] = []
+    if primary_api_key and primary_base_url and primary_model:
+        candidates.append({
+            "provider": _provider_name(primary_base_url, "PRIMARY"),
+            "api_key": primary_api_key,
+            "base_url": primary_base_url,
+            "model": primary_model,
+        })
+
+    grsai_key = env.get("GRSAI_OPENAI_API_KEY") or env.get("GEMINI_API_KEY") or ""
+    grsai_base = env.get("GRSAI_OPENAI_API_BASE") or env.get("GEMINI_API_BASE") or ""
+    grsai_models = unique_values([
+        primary_model if primary_api_key == grsai_key and primary_base_url == grsai_base else "",
+        *comma_values(env.get("GRSAI_FALLBACK_MODELS")),
+        env.get("GEMINI_MODEL"),
+        env.get("NANO_BANANA2_MODEL"),
+        *DEFAULT_GRS_MODEL_ORDER,
+    ])
+    _append_provider_candidates(candidates, "GRSAI", grsai_key, grsai_base, grsai_models)
+
+    zhenzhen_key = env.get("ZHENZHEN_OPENAI_API_KEY") or ""
+    zhenzhen_base = env.get("ZHENZHEN_OPENAI_API_BASE") or ""
+    zhenzhen_models = unique_values([
+        *comma_values(env.get("ZHENZHEN_FALLBACK_MODELS")),
+        *DEFAULT_ZHENZHEN_MODEL_ORDER,
+    ])
+    _append_provider_candidates(candidates, "ZHENZHEN", zhenzhen_key, zhenzhen_base, zhenzhen_models)
+    return _dedupe_analysis_candidates(candidates)
+
+
+def _append_provider_candidates(candidates, provider, api_key, base_url, models):
+    api_key = (api_key or "").strip()
+    base_url = (base_url or "").strip()
+    if not api_key or not base_url:
+        return
+    for model in models:
+        candidates.append({
+            "provider": provider,
+            "api_key": api_key,
+            "base_url": base_url,
+            "model": model,
+        })
+
+
+def _dedupe_analysis_candidates(candidates):
+    result = []
+    seen = set()
+    for candidate in candidates:
+        key = (candidate["provider"], candidate["base_url"].rstrip("/"), candidate["model"])
+        if key in seen:
+            continue
+        seen.add(key)
+        result.append(candidate)
+    return result
+
+
+def _provider_name(base_url: str, default: str) -> str:
+    lowered = base_url.lower()
+    if "grsai" in lowered:
+        return "GRSAI"
+    if "t8star" in lowered or "zhenzhen" in lowered:
+        return "ZHENZHEN"
+    if "generativelanguage.googleapis.com" in lowered:
+        return "GEMINI"
+    return default
+
+
+def lan_ip_address() -> str:
+    configured = os.environ.get("SHARE_HOST") or os.environ.get("LAN_HOST")
+    if configured:
+        return configured.strip()
+
+    candidates: list[str] = []
+    candidates.extend(_system_ip_candidates())
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+            sock.connect(("8.8.8.8", 80))
+            candidates.append(sock.getsockname()[0])
+    except OSError:
+        pass
+
+    for ip in candidates:
+        if _is_preferred_lan_ip(ip):
+            return ip
+    for ip in candidates:
+        if _is_usable_lan_ip(ip):
+            return ip
+    return "127.0.0.1"
+
+
+def _system_ip_candidates() -> list[str]:
+    commands = (["ifconfig"], ["ipconfig"])
+    addresses: list[str] = []
+    for command in commands:
+        try:
+            output = subprocess.check_output(command, text=True, stderr=subprocess.DEVNULL)
+        except (OSError, subprocess.CalledProcessError):
+            continue
+        addresses.extend(re.findall(r"(?:inet\s|IPv4 Address[.\s]*:?\s*)(\d+\.\d+\.\d+\.\d+)", output))
+    return addresses
+
+
+def _is_preferred_lan_ip(ip: str) -> bool:
+    try:
+        address = ipaddress.ip_address(ip)
+    except ValueError:
+        return False
+    return (
+        address.version == 4
+        and address.is_private
+        and not address.is_loopback
+        and not str(address).startswith("198.18.")
+    )
+
+
+def _is_usable_lan_ip(ip: str) -> bool:
+    try:
+        address = ipaddress.ip_address(ip)
+    except ValueError:
+        return False
+    return address.version == 4 and not address.is_loopback and not address.is_link_local
+
+
 def parse_urls(text: str) -> list[str]:
     urls = []
     for line in text.splitlines():
-        line = line.strip()
+        line = line.strip().rstrip("，,。.;；")
         if line and not line.startswith("#"):
             urls.append(line)
     return urls
@@ -124,6 +277,29 @@ def unique_folder(parent: Path, base_name: str) -> Path:
         candidate = parent / f"{base_name}_{index}"
         index += 1
     return candidate
+
+
+def register_artifact(folder: str | Path | None) -> str:
+    if not folder:
+        return ""
+    path = Path(folder).expanduser().resolve()
+    if not path.exists() or not path.is_dir():
+        return ""
+    token = uuid.uuid4().hex
+    ARTIFACTS[token] = path
+    return f"/api/artifacts/{token}/download"
+
+
+def zip_folder(folder: Path) -> Path:
+    RUNTIME_DIR.mkdir(parents=True, exist_ok=True)
+    zip_dir = RUNTIME_DIR / "zips"
+    zip_dir.mkdir(parents=True, exist_ok=True)
+    zip_path = zip_dir / f"{safe_filename(folder.name)}_{uuid.uuid4().hex[:8]}.zip"
+    with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        for file_path in folder.rglob("*"):
+            if file_path.is_file():
+                archive.write(file_path, arcname=file_path.relative_to(folder.parent))
+    return zip_path
 
 
 def quality_to_format(quality: str) -> str:
@@ -254,6 +430,14 @@ def format_seconds(seconds):
     return f"{minutes}:{sec:02d}"
 
 
+def non_negative_float(value, default: float = 0) -> float:
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return default
+    return max(0, parsed)
+
+
 def missing_tools() -> list[str]:
     return [tool for tool in ("ffmpeg", "ffprobe") if shutil.which(tool) is None]
 
@@ -311,6 +495,7 @@ def create_app() -> Flask:
     if configured_cookie_mode == "none" and default_browser_cookies(env) != "none":
         configured_cookie_mode = "browser"
     js_runtime_path = default_js_runtime_path(env)
+    lan_ip = lan_ip_address()
 
     @app.get("/")
     def index():
@@ -336,6 +521,13 @@ def create_app() -> Flask:
             "hasJsRuntime": bool(js_runtime_path),
             "missingTools": missing_tools(),
             "ytDlpVersion": YT_DLP_VERSION,
+            "localUrl": f"http://127.0.0.1:{SERVER_PORT}/",
+            "lanUrl": f"http://{lan_ip}:{SERVER_PORT}/" if lan_ip != "127.0.0.1" else "",
+            "analysisFallbackCount": len(build_analysis_candidates(env, {
+                "apiKey": env.get("GEMINI_API_KEY") or env.get("GRSAI_OPENAI_API_KEY") or "",
+                "apiBase": env.get("GEMINI_API_BASE") or env.get("GRSAI_OPENAI_API_BASE") or "https://generativelanguage.googleapis.com",
+                "model": env.get("GEMINI_MODEL") or env.get("NANO_BANANA2_MODEL") or "gemini-3.5-flash",
+            })),
         })
 
     @app.post("/api/jobs")
@@ -394,13 +586,23 @@ def create_app() -> Flask:
 
     @app.post("/api/open-folder")
     def open_folder():
+        if request.remote_addr not in {"127.0.0.1", "::1"}:
+            return jsonify({"error": "只能在服务器本机打开文件夹"}), 403
         folder = request.get_json(force=True).get("folder", "")
         if folder:
             path = Path(folder).expanduser()
-            path.mkdir(parents=True, exist_ok=True)
-            import subprocess
+            if not path.exists() or not path.is_dir():
+                return jsonify({"error": "文件夹不存在"}), 400
             subprocess.run(["open", str(path)], check=False)
         return jsonify({"ok": True})
+
+    @app.get("/api/artifacts/<token>/download")
+    def download_artifact(token):
+        folder = ARTIFACTS.get(token)
+        if not folder or not folder.exists() or not folder.is_dir():
+            return jsonify({"error": "下载文件不存在或已过期"}), 404
+        zip_path = zip_folder(folder)
+        return send_file(zip_path, as_attachment=True, download_name=f"{safe_filename(folder.name)}.zip")
 
     return app
 
@@ -432,6 +634,7 @@ def run_download_job(job: Job):
         job.log(f"[{index}/{len(job.urls)}] {url}")
         try:
             result = download_one(url, output_dir, job.options, job.log)
+            result["downloadUrl"] = register_artifact(result.get("folder"))
             job.results.append({"status": "完成", **result})
         except Exception as exc:
             job.log(f"失败: {exc}")
@@ -474,7 +677,7 @@ def download_one(url: str, output_dir: Path, options: dict, log):
         "concurrent_fragment_downloads": 4,
         "socket_timeout": 30,
     }
-    sleep_interval = float(options.get("sleepInterval") or 0)
+    sleep_interval = non_negative_float(options.get("sleepInterval"))
     if sleep_interval > 0:
         ydl_opts["sleep_interval"] = sleep_interval
         ydl_opts["max_sleep_interval"] = max(sleep_interval, sleep_interval + 2)
@@ -552,7 +755,8 @@ def run_clip_job(job: Job):
         browser_cookies=browser_cookies,
         js_runtime_path=job.options.get("jsRuntimePath") or None,
         player_client=job.options.get("playerClient") or None,
-        sleep_interval=float(job.options.get("sleepInterval") or 0),
+        sleep_interval=non_negative_float(job.options.get("sleepInterval")),
+        analysis_candidates=build_analysis_candidates(load_env(ENV_PATH), job.options),
         log_callback=job.log,
         stop_check=lambda: job.stop_requested,
     )
@@ -561,10 +765,12 @@ def run_clip_job(job: Job):
         if item.get("error"):
             job.results.append({"status": "失败", "title": item.get("url", ""), "folder": ""})
         else:
+            download_url = register_artifact(item.get("folder"))
             job.results.append({
                 "status": "完成",
                 "title": f"{item.get('title', '')} - {len(item.get('clips', []))} 个片段",
                 "folder": item.get("folder", ""),
+                "downloadUrl": download_url,
             })
 
 
@@ -643,6 +849,19 @@ INDEX_HTML = r"""
     button.secondary { background: #fff; color: var(--text); border-color: var(--line); }
     button.stop { background: var(--red); }
     button:disabled { opacity: .55; cursor: not-allowed; }
+    a.download-link {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      min-height: 32px;
+      border: 1px solid var(--blue);
+      border-radius: 6px;
+      padding: 6px 10px;
+      color: var(--blue);
+      text-decoration: none;
+      white-space: nowrap;
+      background: #fff;
+    }
     .check { display: flex; align-items: center; gap: 8px; color: var(--text); }
     .check input { width: auto; }
     .log {
@@ -684,7 +903,7 @@ INDEX_HTML = r"""
 <div class="app">
   <header>
     <h1>自动高光剪辑</h1>
-    <span>YouTube 批量下载 / Gemini 高光分析 / 原片与片段归档</span>
+    <span id="shareInfo">YouTube 批量下载 / Gemini 高光分析 / 原片与片段归档</span>
   </header>
   <main>
     <section id="download">
@@ -716,7 +935,7 @@ INDEX_HTML = r"""
       </div>
       <div id="downloadLog" class="log"></div>
       <table>
-        <thead><tr><th>状态</th><th>内容</th><th>文件夹</th></tr></thead>
+        <thead><tr><th>状态</th><th>内容</th><th>下载</th><th class="local-only">文件夹</th></tr></thead>
         <tbody id="downloadResults"></tbody>
       </table>
     </section>
@@ -754,7 +973,7 @@ INDEX_HTML = r"""
       </div>
       <div id="clipLog" class="log"></div>
       <table>
-        <thead><tr><th>状态</th><th>内容</th><th>文件夹</th></tr></thead>
+        <thead><tr><th>状态</th><th>内容</th><th>下载</th><th class="local-only">文件夹</th></tr></thead>
         <tbody id="clipResults"></tbody>
       </table>
     </section>
@@ -772,6 +991,9 @@ const cookieBrowsers = ["none", "chrome", "safari", "firefox", "edge", "brave", 
 const jobs = {};
 
 function $(id) { return document.getElementById(id); }
+function isLocalClient() {
+  return ["127.0.0.1", "localhost", "::1"].includes(window.location.hostname);
+}
 
 function fillQuality(id, value) {
   const select = $(id);
@@ -819,9 +1041,16 @@ async function loadConfig() {
   $("clipProxy").value = cfg.proxy || "";
   $("downloadCookies").value = cfg.cookiesFile || "";
   $("clipCookies").value = cfg.cookiesFile || "";
+  if (cfg.lanUrl) {
+    $("shareInfo").textContent = `同事访问: ${cfg.lanUrl}`;
+  }
+  document.querySelectorAll(".local-only").forEach(el => {
+    el.style.display = isLocalClient() ? "" : "none";
+  });
   const cookieText = cfg.hasEnvCookies ? "Env Cookies 已配置" : "Env Cookies 未配置";
   const jsText = cfg.hasJsRuntime ? "JS Runtime 已就绪" : "JS Runtime 未找到";
-  $("tools").textContent = cfg.missingTools.length ? `缺少: ${cfg.missingTools.join(", ")} · ${cookieText} · ${jsText}` : `FFmpeg 已就绪 · yt-dlp ${cfg.ytDlpVersion} · ${cookieText} · ${jsText}`;
+  const fallbackText = `分析候选 ${cfg.analysisFallbackCount || 1} 个`;
+  $("tools").textContent = cfg.missingTools.length ? `缺少: ${cfg.missingTools.join(", ")} · ${cookieText} · ${jsText} · ${fallbackText}` : `FFmpeg 已就绪 · yt-dlp ${cfg.ytDlpVersion} · ${cookieText} · ${jsText} · ${fallbackText}`;
 }
 
 function setBusy(mode, busy) {
@@ -842,8 +1071,27 @@ function renderResults(mode, results) {
   body.innerHTML = "";
   for (const item of results) {
     const tr = document.createElement("tr");
-    tr.innerHTML = `<td>${item.status || ""}</td><td>${item.title || ""}</td><td class="path">${item.folder || ""}</td>`;
-    tr.querySelector(".path").addEventListener("dblclick", () => openFolder(item.folder));
+    const status = document.createElement("td");
+    status.textContent = item.status || "";
+    const title = document.createElement("td");
+    title.textContent = item.title || "";
+    const download = document.createElement("td");
+    if (item.downloadUrl) {
+      const link = document.createElement("a");
+      link.className = "download-link";
+      link.href = item.downloadUrl;
+      link.textContent = "下载";
+      download.appendChild(link);
+    }
+    const folder = document.createElement("td");
+    folder.className = "path local-only";
+    folder.textContent = item.folder || "";
+    folder.style.display = isLocalClient() ? "" : "none";
+    folder.addEventListener("dblclick", () => openFolder(item.folder));
+    tr.appendChild(status);
+    tr.appendChild(title);
+    tr.appendChild(download);
+    tr.appendChild(folder);
     body.appendChild(tr);
   }
 }
@@ -936,9 +1184,14 @@ loadConfig();
 
 def main():
     app = create_app()
-    url = "http://127.0.0.1:7860"
-    threading.Timer(0.8, lambda: webbrowser.open(url)).start()
-    app.run(host="127.0.0.1", port=7860, debug=False, threaded=True)
+    local_url = f"http://127.0.0.1:{SERVER_PORT}/"
+    lan_ip = lan_ip_address()
+    lan_url = f"http://{lan_ip}:{SERVER_PORT}/" if lan_ip != "127.0.0.1" else ""
+    print(f"本机访问: {local_url}")
+    if lan_url:
+        print(f"同事访问: {lan_url}")
+    threading.Timer(0.8, lambda: webbrowser.open(local_url)).start()
+    app.run(host="0.0.0.0", port=SERVER_PORT, debug=False, threaded=True)
 
 
 if __name__ == "__main__":

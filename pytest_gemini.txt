@@ -1,0 +1,25 @@
+============================= test session starts ==============================
+platform darwin -- Python 3.14.5, pytest-9.0.3, pluggy-1.6.0 -- /Users/biantongchuangchuanmei/Desktop/自动剪辑/.venv/bin/python3
+cachedir: .pytest_cache
+rootdir: /Users/biantongchuangchuanmei/Desktop/自动剪辑
+configfile: pyproject.toml
+collecting ... collected 4 items
+
+tests/test_gemini_analyzer.py::test_gemini_analyze_with_supplier[GRSAI / gemini-3.1-pro] 
+GRSAI / gemini-3.1-pro -> 1 highlights
+  1. [0s-15.5s] score=95 外籍员工爆笑猜数字
+PASSED
+tests/test_gemini_analyzer.py::test_gemini_analyze_with_supplier[GRSAI / gemini-3.5-flash] SKIPPED
+tests/test_gemini_analyzer.py::test_gemini_analyze_with_supplier[ZHENZHEN / gemini-2.5-pro] 
+ZHENZHEN / gemini-2.5-pro -> 3 highlights
+  1. [0s-10.0s] score=90 开局触发免费旋转
+  2. [10.0s-15.0s] score=95 免费旋转连续中奖
+  3. [15.0s-20.0s] score=98 巨额爆分结算
+PASSED
+tests/test_gemini_analyzer.py::test_gemini_analyze_with_supplier[ZHENZHEN / gemini-2.5-flash] 
+ZHENZHEN / gemini-2.5-flash -> 2 highlights
+  1. [0s-12.0s] score=95 触发特殊模式瞬间
+  2. [15.0s-25.0s] score=98 连续爆分高能结算
+PASSED
+
+=================== 3 passed, 1 skipped in 809.85s (0:13:29) ===================
